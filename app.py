@@ -1,5 +1,6 @@
 import sqlite3
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -37,7 +38,11 @@ conn.execute(
         tipo TEXT NOT NULL CHECK (tipo IN ('Entrata', 'Uscita')),
         importo REAL NOT NULL CHECK (importo > 0),
         evento TEXT NOT NULL DEFAULT '',
-        collegato_id INTEGER  -- per i giroconti: id dell'operazione corrispondente nell'altra cassa
+        collegato_id INTEGER,  -- per i giroconti: id dell'operazione corrispondente nell'altra cassa
+        creato_da TEXT,
+        creato_il TEXT,
+        modificato_da TEXT,
+        modificato_il TEXT
     )"""
 )
 # Aggiunge le colonne ai database creati prima che esistessero
@@ -46,8 +51,47 @@ if "evento" not in colonne:
     conn.execute("ALTER TABLE movimenti ADD COLUMN evento TEXT NOT NULL DEFAULT ''")
 if "collegato_id" not in colonne:
     conn.execute("ALTER TABLE movimenti ADD COLUMN collegato_id INTEGER")
+for colonna in ["creato_da", "creato_il", "modificato_da", "modificato_il"]:
+    if colonna not in colonne:
+        conn.execute(f"ALTER TABLE movimenti ADD COLUMN {colonna} TEXT")
 
-cassa = st.sidebar.radio("Cassa", CASSE)
+PERMESSI = {
+    "Antonio": CASSE,
+    "Elena": CASSE,
+    "Nicola": CASSE,
+    "Lucia": ["Cassa Lupetti"],
+    "Luca": ["Cassa Lupetti"],
+    "Pina M.": ["Cassa Lupetti"],
+    "Pina E.": ["Cassa Lupetti"],
+    "Laura": ["Cassa Reparto"],
+    "Enrico": ["Cassa Reparto"],
+    "Raffaele": ["Cassa Reparto"],
+    "Roberta": ["Cassa Reparto"],
+    "Simone": ["Cassa Clan"],
+    "Filomena": ["Cassa Clan"],
+    "Rosaria": ["Cassa Clan"],
+    "Giuseppe": ["Cassa Clan"],
+}
+
+if "utente" not in st.session_state:
+    st.title("Accesso")
+    with st.form("login"):
+        utente = st.selectbox("Utente", sorted(PERMESSI), index=None, placeholder="Seleziona il tuo nome")
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("Entra", type="primary"):
+            if utente is not None and password == st.secrets["password"]:
+                st.session_state["utente"] = utente
+                st.rerun()
+            st.error("Utente o password non corretti")
+    st.stop()
+
+utente = st.session_state["utente"]
+st.sidebar.write(f"Utente: **{utente}**")
+if st.sidebar.button("Esci"):
+    del st.session_state["utente"]
+    st.rerun()
+
+cassa = st.sidebar.radio("Cassa", PERMESSI[utente])
 
 st.title(cassa)
 
@@ -60,6 +104,12 @@ def form_operazione(cassa, movimento=None):
     """Campi dell'operazione: vuoti per una nuova, precompilati se si modifica `movimento`."""
     st.caption(cassa)
     m = movimento
+    if m is not None:
+        quando = lambda iso: datetime.fromisoformat(iso).strftime("%d/%m/%Y %H:%M") if iso else "?"
+        st.caption(
+            f"Creata da {m['creato_da'] or '?'} il {quando(m['creato_il'])}"
+            + (f" · Ultima modifica di {m['modificato_da']} il {quando(m['modificato_il'])}" if m["modificato_da"] else "")
+        )
     categoria = st.selectbox(
         "Categoria",
         CATEGORIE,
@@ -113,33 +163,36 @@ def form_operazione(cassa, movimento=None):
             st.error("Seleziona la cassa del giroconto")
         else:
             valori = (categoria, data.isoformat(), tipo, importo, evento.strip())
+            firma = (utente, datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M"))
             with conn:
                 if m is None:
                     id_movimento = conn.execute(
-                        "INSERT INTO movimenti (categoria, data, tipo, importo, evento, cassa) VALUES (?, ?, ?, ?, ?, ?)",
-                        (*valori, cassa),
+                        "INSERT INTO movimenti (categoria, data, tipo, importo, evento, cassa, creato_da, creato_il)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (*valori, cassa, *firma),
                     ).lastrowid
                 else:
                     id_movimento = int(m.name)
                     conn.execute(
-                        "UPDATE movimenti SET categoria = ?, data = ?, tipo = ?, importo = ?, evento = ? WHERE id = ?",
-                        (*valori, id_movimento),
+                        "UPDATE movimenti SET categoria = ?, data = ?, tipo = ?, importo = ?, evento = ?,"
+                        " modificato_da = ?, modificato_il = ? WHERE id = ?",
+                        (*valori, *firma, id_movimento),
                     )
                 if categoria == "Giroconto":
                     # Operazione speculare nell'altra cassa: stessi dati, tipo opposto
                     speculare = (categoria, data.isoformat(), TIPI[1 - TIPI.index(tipo)], importo, evento.strip(), altra_cassa)
                     if collegato is None:
                         collegato = conn.execute(
-                            "INSERT INTO movimenti (categoria, data, tipo, importo, evento, cassa, collegato_id)"
-                            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (*speculare, id_movimento),
+                            "INSERT INTO movimenti (categoria, data, tipo, importo, evento, cassa, collegato_id,"
+                            " creato_da, creato_il) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (*speculare, id_movimento, *firma),
                         ).lastrowid
                         conn.execute("UPDATE movimenti SET collegato_id = ? WHERE id = ?", (collegato, id_movimento))
                     else:
                         conn.execute(
-                            "UPDATE movimenti SET categoria = ?, data = ?, tipo = ?, importo = ?, evento = ?, cassa = ?"
-                            " WHERE id = ?",
-                            (*speculare, collegato),
+                            "UPDATE movimenti SET categoria = ?, data = ?, tipo = ?, importo = ?, evento = ?, cassa = ?,"
+                            " modificato_da = ?, modificato_il = ? WHERE id = ?",
+                            (*speculare, *firma, collegato),
                         )
                 elif collegato is not None:
                     # Non è più un giroconto: l'operazione speculare non serve più
@@ -172,7 +225,7 @@ def modifica_operazione(cassa, movimento):
 
 
 movimenti = pd.read_sql_query(
-    "SELECT id, data, tipo, categoria, evento, importo, collegato_id FROM movimenti WHERE cassa = ? ORDER BY data",
+    "SELECT id, data, tipo, categoria, evento, importo, collegato_id, creato_da, creato_il, modificato_da, modificato_il FROM movimenti WHERE cassa = ? ORDER BY data",
     conn,
     params=(cassa,),
     index_col="id",
