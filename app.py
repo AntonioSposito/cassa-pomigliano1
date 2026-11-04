@@ -195,11 +195,14 @@ def form_operazione(cassa, movimento=None):
         index=CATEGORIE.index(m["categoria"]) if m is not None else None,
         placeholder="Seleziona una categoria",
     )
+    data_minima, data_massima = date(2026, 10, 1), date(2027, 9, 30)
+    data_salvata = date.fromisoformat(m["data"]) if m is not None else None
     data = st.date_input(
         "Data operazione",
-        value=date.fromisoformat(m["data"]) if m is not None else None,
-        min_value=date(2026, 9, 1),
-        max_value=date(2027, 9, 30),
+        # Una data salvata fuori intervallo farebbe andare in errore il campo: va scelta di nuovo
+        value=data_salvata if data_salvata and data_minima <= data_salvata <= data_massima else None,
+        min_value=data_minima,
+        max_value=data_massima,
         format="DD/MM/YYYY",
     )
     tipo = st.radio("Tipo", TIPI, index=TIPI.index(m["tipo"]) if m is not None else None, horizontal=True)
@@ -225,7 +228,7 @@ def form_operazione(cassa, movimento=None):
         step=0.01,
         format="%.2f",
     )
-    evento = st.text_input("Evento", value=m["evento"] if m is not None else "", help=AIUTO_EVENTO)
+    evento = st.text_input("Descrizione entrata/spesa", value=m["evento"] if m is not None else "", help=AIUTO_EVENTO)
     if categoria == "Giroconto":
         if tipo is None or importo is None or altra_cassa is None:
             st.caption("Compila Tipo, Importo e cassa per vedere l'anteprima del giroconto")
@@ -238,7 +241,7 @@ def form_operazione(cassa, movimento=None):
             )
     if st.button("Salva", type="primary"):
         if categoria is None or data is None or tipo is None or importo is None or not evento.strip():
-            st.error("Compila Categoria, Data operazione, Tipo, Importo ed Evento")
+            st.error("Compila Categoria, Data operazione, Tipo, Importo e Descrizione entrata/spesa")
         elif categoria == "Giroconto" and altra_cassa is None:
             st.error("Seleziona la cassa del giroconto")
         else:
@@ -340,7 +343,7 @@ selezione = st.dataframe(
     column_order=["data", "evento", "categoria", "tipo", "importo"],
     column_config={
         "data": "Data",
-        "evento": st.column_config.TextColumn("Evento", help=AIUTO_EVENTO),
+        "evento": st.column_config.TextColumn("Descrizione entrata/spesa", help=AIUTO_EVENTO),
         "categoria": "Categoria",
         "tipo": "Tipo",
         "importo": "Importo",
