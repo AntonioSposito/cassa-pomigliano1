@@ -1,9 +1,11 @@
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from psycopg_pool import ConnectionPool
 
 st.set_page_config(page_title="Cassa Pomigliano 1", page_icon="⚜️")
 
@@ -27,35 +29,9 @@ CATEGORIE = [
     "Varie",
 ]
 
-# Il dialog gira in un thread diverso da quello che ha aperto la connessione
-conn = sqlite3.connect("bilancio.db", check_same_thread=False)
-conn.execute(
-    """CREATE TABLE IF NOT EXISTS movimenti (
-        id INTEGER PRIMARY KEY,
-        cassa TEXT NOT NULL,
-        categoria TEXT NOT NULL,
-        data TEXT NOT NULL,
-        tipo TEXT NOT NULL CHECK (tipo IN ('Entrata', 'Uscita')),
-        importo REAL NOT NULL CHECK (importo > 0),
-        evento TEXT NOT NULL DEFAULT '',
-        collegato_id INTEGER,  -- per i giroconti: id dell'operazione corrispondente nell'altra cassa
-        creato_da TEXT,
-        creato_il TEXT,
-        modificato_da TEXT,
-        modificato_il TEXT
-    )"""
-)
-# Aggiunge le colonne ai database creati prima che esistessero
-colonne = [col[1] for col in conn.execute("PRAGMA table_info(movimenti)")]
-if "evento" not in colonne:
-    conn.execute("ALTER TABLE movimenti ADD COLUMN evento TEXT NOT NULL DEFAULT ''")
-if "collegato_id" not in colonne:
-    conn.execute("ALTER TABLE movimenti ADD COLUMN collegato_id INTEGER")
-for colonna in ["creato_da", "creato_il", "modificato_da", "modificato_il"]:
-    if colonna not in colonne:
-        conn.execute(f"ALTER TABLE movimenti ADD COLUMN {colonna} TEXT")
-
-PERMESSI = {
+AMMINISTRATORE = "Antonio"
+GESTIONE_PERMESSI = "Gestione permessi"
+PERMESSI_INIZIALI = {
     "Antonio": CASSE,
     "Elena": CASSE,
     "Nicola": CASSE,
@@ -73,10 +49,90 @@ PERMESSI = {
     "Giuseppe": ["Cassa Clan"],
 }
 
+class ConnessioneSQLite:
+    """Accetta le stesse query di psycopg (segnaposto %s)."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, parametri=()):
+        return self.conn.execute(sql.replace("%s", "?"), parametri)
+
+    def cursor(self):
+        return self
+
+    def executemany(self, sql, righe):
+        return self.conn.executemany(sql.replace("%s", "?"), righe)
+
+
+class PoolSQLite:
+    """Stessa interfaccia di ConnectionPool, per lavorare in locale su bilancio.db."""
+
+    @contextmanager
+    def connection(self):
+        conn = sqlite3.connect("bilancio.db")
+        try:
+            with conn:
+                yield ConnessioneSQLite(conn)
+        finally:
+            conn.close()
+
+
+@st.cache_resource
+def crea_pool():
+    """Neon se nei secrets c'è database_url, altrimenti bilancio.db. Le tabelle vengono create una volta sola."""
+    if "database_url" in st.secrets:
+        tipo_id = "SERIAL"
+        pool = ConnectionPool(
+            st.secrets["database_url"],
+            min_size=0,
+            max_size=4,
+            check=ConnectionPool.check_connection,  # Neon chiude le connessioni inattive
+            kwargs={"prepare_threshold": None},  # richiesto dal connection pooling di Neon
+        )
+    else:
+        tipo_id = "INTEGER"
+        pool = PoolSQLite()
+    with pool.connection() as conn:
+        conn.execute(
+            f"""CREATE TABLE IF NOT EXISTS movimenti (
+                id {tipo_id} PRIMARY KEY,
+                cassa TEXT NOT NULL,
+                categoria TEXT NOT NULL,
+                data TEXT NOT NULL,
+                tipo TEXT NOT NULL CHECK (tipo IN ('Entrata', 'Uscita')),
+                importo NUMERIC(12, 2) NOT NULL CHECK (importo > 0),
+                evento TEXT NOT NULL DEFAULT '',
+                collegato_id INTEGER,  -- per i giroconti: id dell'operazione corrispondente nell'altra cassa
+                creato_da TEXT,
+                creato_il TEXT,
+                modificato_da TEXT,
+                modificato_il TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS permessi (
+                utente TEXT NOT NULL,
+                cassa TEXT NOT NULL,
+                PRIMARY KEY (utente, cassa)
+            )"""
+        )
+        # Solo al primo avvio: poi i permessi si cambiano dall'app. L'amministratore non è modificabile,
+        # quindi la tabella non resta mai vuota.
+        if conn.execute("SELECT 1 FROM permessi LIMIT 1").fetchone() is None:
+            conn.cursor().executemany(
+                "INSERT INTO permessi (utente, cassa) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                [(nome, c) for nome, casse in PERMESSI_INIZIALI.items() for c in casse],
+            )
+    return pool
+
+
+pool = crea_pool()
+
 if "utente" not in st.session_state:
     st.title("Accesso")
     with st.form("login"):
-        utente = st.selectbox("Utente", sorted(PERMESSI), index=None, placeholder="Seleziona il tuo nome")
+        utente = st.selectbox("Utente", sorted(PERMESSI_INIZIALI), index=None, placeholder="Seleziona il tuo nome")
         password = st.text_input("Password", type="password")
         if st.form_submit_button("Entra", type="primary"):
             if utente is not None and password == st.secrets["password"]:
@@ -91,9 +147,32 @@ if st.sidebar.button("Esci"):
     del st.session_state["utente"]
     st.rerun()
 
-cassa = st.sidebar.radio("Cassa", PERMESSI[utente])
+with pool.connection() as conn:
+    permessi = set(conn.execute("SELECT utente, cassa FROM permessi").fetchall())
+voci = [c for c in CASSE if (utente, c) in permessi]
+if utente == AMMINISTRATORE:
+    voci.append(GESTIONE_PERMESSI)
+if not voci:
+    st.info(f"Non hai accesso a nessuna cassa. Chiedi ad {AMMINISTRATORE} di abilitarti.")
+    st.stop()
+
+cassa = st.sidebar.radio("Cassa", voci)
 
 st.title(cassa)
+
+if cassa == GESTIONE_PERMESSI:
+    altri_utenti = [nome for nome in sorted(PERMESSI_INIZIALI) if nome != AMMINISTRATORE]
+    tabella = pd.DataFrame({c: [(nome, c) in permessi for nome in altri_utenti] for c in CASSE}, index=altri_utenti)
+    tabella = st.data_editor(tabella)
+    if st.button("Salva permessi", type="primary"):
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM permessi WHERE utente != %s", (AMMINISTRATORE,))
+            conn.cursor().executemany(
+                "INSERT INTO permessi (utente, cassa) VALUES (%s, %s)",
+                [(nome, c) for nome in altri_utenti for c in CASSE if tabella.loc[nome, c]],
+            )
+        st.success("Permessi salvati")
+    st.stop()
 
 
 TIPI = ["Entrata", "Uscita"]
@@ -130,7 +209,8 @@ def form_operazione(cassa, movimento=None):
         altre_casse = [c for c in CASSE if c != cassa]
         cassa_collegata = None
         if collegato is not None:
-            cassa_collegata = conn.execute("SELECT cassa FROM movimenti WHERE id = ?", (collegato,)).fetchone()[0]
+            with pool.connection() as conn:
+                cassa_collegata = conn.execute("SELECT cassa FROM movimenti WHERE id = %s", (collegato,)).fetchone()[0]
         altra_cassa = st.selectbox(
             "Cassa di destinazione" if tipo == "Uscita" else "Cassa di provenienza",
             altre_casse,
@@ -164,18 +244,18 @@ def form_operazione(cassa, movimento=None):
         else:
             valori = (categoria, data.isoformat(), tipo, importo, evento.strip())
             firma = (utente, datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M"))
-            with conn:
+            with pool.connection() as conn:
                 if m is None:
                     id_movimento = conn.execute(
                         "INSERT INTO movimenti (categoria, data, tipo, importo, evento, cassa, creato_da, creato_il)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                         (*valori, cassa, *firma),
-                    ).lastrowid
+                    ).fetchone()[0]
                 else:
                     id_movimento = int(m.name)
                     conn.execute(
-                        "UPDATE movimenti SET categoria = ?, data = ?, tipo = ?, importo = ?, evento = ?,"
-                        " modificato_da = ?, modificato_il = ? WHERE id = ?",
+                        "UPDATE movimenti SET categoria = %s, data = %s, tipo = %s, importo = %s, evento = %s,"
+                        " modificato_da = %s, modificato_il = %s WHERE id = %s",
                         (*valori, *firma, id_movimento),
                     )
                 if categoria == "Giroconto":
@@ -184,20 +264,20 @@ def form_operazione(cassa, movimento=None):
                     if collegato is None:
                         collegato = conn.execute(
                             "INSERT INTO movimenti (categoria, data, tipo, importo, evento, cassa, collegato_id,"
-                            " creato_da, creato_il) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            " creato_da, creato_il) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                             (*speculare, id_movimento, *firma),
-                        ).lastrowid
-                        conn.execute("UPDATE movimenti SET collegato_id = ? WHERE id = ?", (collegato, id_movimento))
+                        ).fetchone()[0]
+                        conn.execute("UPDATE movimenti SET collegato_id = %s WHERE id = %s", (collegato, id_movimento))
                     else:
                         conn.execute(
-                            "UPDATE movimenti SET categoria = ?, data = ?, tipo = ?, importo = ?, evento = ?, cassa = ?,"
-                            " modificato_da = ?, modificato_il = ? WHERE id = ?",
+                            "UPDATE movimenti SET categoria = %s, data = %s, tipo = %s, importo = %s, evento = %s, cassa = %s,"
+                            " modificato_da = %s, modificato_il = %s WHERE id = %s",
                             (*speculare, *firma, collegato),
                         )
                 elif collegato is not None:
                     # Non è più un giroconto: l'operazione speculare non serve più
-                    conn.execute("DELETE FROM movimenti WHERE id = ?", (collegato,))
-                    conn.execute("UPDATE movimenti SET collegato_id = NULL WHERE id = ?", (id_movimento,))
+                    conn.execute("DELETE FROM movimenti WHERE id = %s", (collegato,))
+                    conn.execute("UPDATE movimenti SET collegato_id = NULL WHERE id = %s", (id_movimento,))
             st.rerun()
 
 
@@ -216,20 +296,22 @@ def modifica_operazione(cassa, movimento):
         + (" e quella collegata nell'altra cassa" if giroconto else "")
     )
     if st.button("Elimina operazione", disabled=not conferma):
-        with conn:
+        with pool.connection() as conn:
             conn.execute(
-                "DELETE FROM movimenti WHERE id = ? OR id = ?",
+                "DELETE FROM movimenti WHERE id = %s OR id = %s",
                 (int(movimento.name), int(movimento["collegato_id"]) if giroconto else None),
             )
         st.rerun()
 
 
-movimenti = pd.read_sql_query(
-    "SELECT id, data, tipo, categoria, evento, importo, collegato_id, creato_da, creato_il, modificato_da, modificato_il FROM movimenti WHERE cassa = ? ORDER BY data",
-    conn,
-    params=(cassa,),
-    index_col="id",
-)
+with pool.connection() as conn:
+    risultato = conn.execute(
+        "SELECT id, data, tipo, categoria, evento, CAST(importo AS DOUBLE PRECISION) AS importo, collegato_id,"
+        " creato_da, creato_il, modificato_da, modificato_il"
+        " FROM movimenti WHERE cassa = %s ORDER BY data, id",
+        (cassa,),
+    )
+    movimenti = pd.DataFrame(risultato.fetchall(), columns=[c[0] for c in risultato.description]).set_index("id")
 COLORI_TIPO = {
     "Entrata": "background-color: #d4edda; color: #155724",
     "Uscita": "background-color: #f8d7da; color: #721c24",

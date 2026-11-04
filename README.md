@@ -10,3 +10,7 @@ python -m venv .venv
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Database
+
+In `.streamlit/secrets.toml` serve `password`. Se è presente anche `database_url` l'app usa Neon (Postgres), altrimenti `bilancio.db` (SQLite). In locale lascia solo `password`, così le prove non finiscono sui dati veri. I Secrets di Streamlit Cloud contengono entrambe le chiavi.
