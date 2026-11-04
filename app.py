@@ -184,10 +184,12 @@ def form_operazione(cassa, movimento=None):
     st.caption(cassa)
     m = movimento
     if m is not None:
-        quando = lambda iso: datetime.fromisoformat(iso).strftime("%d/%m/%Y %H:%M") if iso else "?"
+        # I valori mancanti possono arrivare come None o NaN a seconda della versione di pandas
+        quando = lambda iso: datetime.fromisoformat(iso).strftime("%d/%m/%Y %H:%M") if pd.notna(iso) else "?"
+        autore = m["creato_da"] if pd.notna(m["creato_da"]) else "?"
         st.caption(
-            f"Creata da {m['creato_da'] or '?'} il {quando(m['creato_il'])}"
-            + (f" · Ultima modifica di {m['modificato_da']} il {quando(m['modificato_il'])}" if m["modificato_da"] else "")
+            f"Creata da {autore} il {quando(m['creato_il'])}"
+            + (f" · Ultima modifica di {m['modificato_da']} il {quando(m['modificato_il'])}" if pd.notna(m["modificato_da"]) else "")
         )
     categoria = st.selectbox(
         "Categoria",
