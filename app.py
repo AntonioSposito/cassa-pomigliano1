@@ -129,6 +129,27 @@ def crea_pool():
 
 pool = crea_pool()
 
+
+# A ogni clic Streamlit riesegue lo script: la cache evita di tornare ogni volta su Neon.
+# Va svuotata dopo ogni scrittura; il ttl copre le modifiche fatte fuori dall'app.
+@st.cache_data(ttl=300)
+def leggi_permessi():
+    with pool.connection() as conn:
+        return set(conn.execute("SELECT utente, cassa FROM permessi").fetchall())
+
+
+@st.cache_data(ttl=300)
+def leggi_movimenti(cassa):
+    with pool.connection() as conn:
+        risultato = conn.execute(
+            "SELECT id, data, tipo, categoria, evento, CAST(importo AS DOUBLE PRECISION) AS importo, collegato_id,"
+            " creato_da, creato_il, modificato_da, modificato_il"
+            " FROM movimenti WHERE cassa = %s ORDER BY data, id",
+            (cassa,),
+        )
+        return pd.DataFrame(risultato.fetchall(), columns=[c[0] for c in risultato.description]).set_index("id")
+
+
 if "utente" not in st.session_state:
     st.title("Accesso")
     with st.form("login"):
@@ -147,8 +168,7 @@ if st.sidebar.button("Esci"):
     del st.session_state["utente"]
     st.rerun()
 
-with pool.connection() as conn:
-    permessi = set(conn.execute("SELECT utente, cassa FROM permessi").fetchall())
+permessi = leggi_permessi()
 voci = [c for c in CASSE if (utente, c) in permessi]
 if utente == AMMINISTRATORE:
     voci.append(GESTIONE_PERMESSI)
@@ -171,6 +191,7 @@ if cassa == GESTIONE_PERMESSI:
                 "INSERT INTO permessi (utente, cassa) VALUES (%s, %s)",
                 [(nome, c) for nome in altri_utenti for c in CASSE if tabella.loc[nome, c]],
             )
+        st.cache_data.clear()
         st.success("Permessi salvati")
     st.stop()
 
@@ -283,6 +304,7 @@ def form_operazione(cassa, movimento=None):
                     # Non è più un giroconto: l'operazione speculare non serve più
                     conn.execute("DELETE FROM movimenti WHERE id = %s", (collegato,))
                     conn.execute("UPDATE movimenti SET collegato_id = NULL WHERE id = %s", (id_movimento,))
+            st.cache_data.clear()
             st.rerun()
 
 
@@ -306,17 +328,11 @@ def modifica_operazione(cassa, movimento):
                 "DELETE FROM movimenti WHERE id = %s OR id = %s",
                 (int(movimento.name), int(movimento["collegato_id"]) if giroconto else None),
             )
+        st.cache_data.clear()
         st.rerun()
 
 
-with pool.connection() as conn:
-    risultato = conn.execute(
-        "SELECT id, data, tipo, categoria, evento, CAST(importo AS DOUBLE PRECISION) AS importo, collegato_id,"
-        " creato_da, creato_il, modificato_da, modificato_il"
-        " FROM movimenti WHERE cassa = %s ORDER BY data, id",
-        (cassa,),
-    )
-    movimenti = pd.DataFrame(risultato.fetchall(), columns=[c[0] for c in risultato.description]).set_index("id")
+movimenti = leggi_movimenti(cassa)
 COLORI_TIPO = {
     "Entrata": "background-color: #d4edda; color: #155724",
     "Uscita": "background-color: #f8d7da; color: #721c24",
